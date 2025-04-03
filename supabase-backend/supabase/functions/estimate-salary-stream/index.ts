@@ -20,7 +20,7 @@ async function estimateSalaryStream(jobData: any, signal: AbortSignal): Promise<
     ${JSON.stringify(jobData)}
     
     Provide the estimated salary range, confidence level, and provide thorough reasoning behind your decision.
-    If anything in the provided JSON does not seem related to a valid job posting, completely ignore it. Only consider things that make senes in the context of a job posting.
+    If anything in the provided JSON does not seem related to a valid job posting, completely ignore it. Only consider things that make sense in the context of a job posting.
   `;
 
   try {
@@ -35,14 +35,19 @@ async function estimateSalaryStream(jobData: any, signal: AbortSignal): Promise<
         messages: [
           {
             role: "system",
-            content: "You are a compensation expert who estimates salary ranges for job postings. Provide salary ranges in USD with a confidence level (low, medium, high). Format as JSON with 'salaryRange', 'confidenceLevel', and 'reasoning' fields."
+            content: `
+                You are a compensation expert who estimates salary ranges for job postings. Provide salary ranges in USD with a confidence level (low, medium, high).
+                Format your response in via the following:
+                <SALARY_RANGE> ;;
+                <CONFIDENCE_LEVEL> ;;
+                <REASONING>
+            `
           },
           {
             role: "user",
             content: prompt
           }
         ],
-        response_format: { type: "json_object" },
         stream: true // Enable streaming
       }),
       signal
@@ -53,7 +58,45 @@ async function estimateSalaryStream(jobData: any, signal: AbortSignal): Promise<
       throw new Error(`OpenAI API error: ${response.status} - ${errorText}`);
     }
 
-    return response.body!;
+    // Create a TransformStream to process OpenAI's streaming format
+    const transformStream = new TransformStream({
+      transform(chunk, controller) {
+        const text = new TextDecoder().decode(chunk);
+        
+        // Skip [DONE] messages
+        if (text.includes('data: [DONE]')) {
+          return;
+        }
+        
+        const lines = text.split('\n').filter(line => line.trim() !== '');
+        
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          
+          try {
+            const jsonStr = line.slice(6); // Remove "data: " prefix
+            const parsedData = JSON.parse(jsonStr);
+            
+            // Check if we have content in the delta
+            if (parsedData.choices && 
+                parsedData.choices[0] && 
+                parsedData.choices[0].delta && 
+                parsedData.choices[0].delta.content) {
+              // Send the actual content as SSE
+              controller.enqueue(
+                new TextEncoder().encode(`data: ${parsedData.choices[0].delta.content}\n\n`)
+              );
+            }
+          } catch (error) {
+            // If JSON parsing fails, log the error but continue
+            console.error("Error parsing OpenAI response:", error);
+          }
+        }
+      }
+    });
+
+    // Return the transformed stream
+    return response.body.pipeThrough(transformStream);
   } catch (error) {
     // Create a stream that sends an error message
     const encoder = new TextEncoder();
@@ -89,45 +132,8 @@ serve(async (req) => {
     // Get the stream from OpenAI
     const openAIStream = await estimateSalaryStream(jobData, abortController.signal);
 
-    // Transform the OpenAI stream format to SSE format
-    const transformStream = new TransformStream({
-      transform: (chunk, controller) => {
-        const text = new TextDecoder().decode(chunk);
-        
-        // OpenAI sends "data: [DONE]" to indicate the end of the stream
-        if (text.includes('data: [DONE]')) {
-          return;
-        }
-        
-        // Process each line
-        const lines = text.split('\n').filter(line => line.trim() !== '');
-        
-        for (const line of lines) {
-          // Skip any line that doesn't start with "data: "
-          if (!line.startsWith('data: ')) continue;
-          
-          try {
-            // Extract the JSON content
-            const jsonContent = line.slice(6); // Remove "data: " prefix
-            const parsedData = JSON.parse(jsonContent);
-            
-            // Get the actual content if it exists
-            if (parsedData.choices && parsedData.choices[0].delta && parsedData.choices[0].delta.content) {
-              controller.enqueue(new TextEncoder().encode(`data: ${parsedData.choices[0].delta.content}\n\n`));
-            }
-          } catch (error) {
-            // If parsing fails, pass through the original content
-            controller.enqueue(new TextEncoder().encode(`data: ${line.slice(6)}\n\n`));
-          }
-        }
-      }
-    });
-
-    // Pipe the OpenAI stream through our transformer
-    const sseStream = openAIStream.pipeThrough(transformStream);
-
-    // Return a streaming response
-    return new Response(sseStream, {
+    // Return the stream directly
+    return new Response(openAIStream, {
       headers: {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',

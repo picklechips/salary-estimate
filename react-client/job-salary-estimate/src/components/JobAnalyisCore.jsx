@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Loader2, Search, DollarSign, Briefcase, MapPin, Building, Calendar, CheckCircle, AlertCircle } from 'lucide-react';
 
 const JobAnalysisApp = () => {
@@ -7,13 +7,31 @@ const JobAnalysisApp = () => {
   const [salaryEstimate, setSalaryEstimate] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isEstimating, setIsEstimating] = useState(false);
+  const [streamingData, setStreamingData] = useState('');
   const [error, setError] = useState('');
+
+  // Effect to parse streaming data into structured salary estimate
+  useEffect(() => {
+    if (!streamingData) return;
+    
+    // Split the streamed data into parts using the ';;' delimiter
+    const parts = streamingData.split(';;').map(part => part.trim());
+    
+    if (parts.length >= 2) {
+      setSalaryEstimate({
+        salaryRange: parts[0],
+        confidenceLevel: parts[1],
+        reasoning: parts.length >= 3 ? parts[2] : '',
+      });
+    }
+  }, [streamingData]);
 
   // Extract job data from URL
   const extractJobData = async () => {
     setIsLoading(true);
     setIsEstimating(false);
     setSalaryEstimate(null);
+    setStreamingData('');
     setError('');
     try {
       const response = await fetch('https://mzmgtykgdhbawgvnltqi.supabase.co/functions/v1/extract-job-data', {
@@ -39,16 +57,17 @@ const JobAnalysisApp = () => {
     }
   };
 
-  // Estimate salary from job data
+  // Estimate salary from job data with streaming support
   const estimateSalary = async () => {
     if (!jobData) return;
     
     setIsEstimating(true);
     setSalaryEstimate(null);
+    setStreamingData('');
     setError('');
     
     try {
-      const response = await fetch('https://mzmgtykgdhbawgvnltqi.supabase.co/functions/v1/estimate-salary', {
+      const response = await fetch('https://mzmgtykgdhbawgvnltqi.supabase.co/functions/v1/estimate-salary-stream', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -61,11 +80,28 @@ const JobAnalysisApp = () => {
         throw new Error(errorData.error || 'Failed to estimate salary');
       }
       
-      const result = await response.json();
-      setSalaryEstimate(result.data)
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          setIsEstimating(false);
+          break;
+        }
+        
+        const text = decoder.decode(value);
+        // Parse SSE format: each message starts with "data: "
+        const lines = text.split('\n')
+          .filter(line => line.startsWith('data: '))
+          .map(line => line.substring(6));
+          
+        lines.forEach(line => {
+          setStreamingData(prev => prev + line);
+        });
+      }
     } catch (err) {
       setError(err.message);
-    } finally {
       setIsEstimating(false);
     }
   };
@@ -74,6 +110,39 @@ const JobAnalysisApp = () => {
     e.preventDefault();
     if (!url.trim()) return;
     extractJobData();
+  };
+
+  // Render a loading/streaming state for the salary estimation
+  const renderStreamingState = () => {
+    if (!streamingData) {
+      return <p className="text-gray-600 italic">Analyzing job data...</p>;
+    }
+    
+    // Split the streamed data to show what we have so far
+    const parts = streamingData.split(';;').map(part => part.trim());
+    
+    return (
+      <div>
+        {parts[0] && (
+          <div className="mb-2">
+            <span className="font-bold">Salary Range:</span> {parts[0]}
+          </div>
+        )}
+        
+        {parts[1] && (
+          <div className="mb-2">
+            <span className="font-bold">Confidence Level:</span> {parts[1]}
+          </div>
+        )}
+        
+        {parts[2] && (
+          <div>
+            <span className="font-bold">Analysis:</span>
+            <div className="whitespace-pre-line">{parts[2]}</div>
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -122,13 +191,12 @@ const JobAnalysisApp = () => {
           <div className="p-6">
             <div className="flex justify-between items-start mb-6">
               <h2 className="text-2xl font-bold text-gray-800">{jobData.title || 'Job Title'}</h2>
-              {!salaryEstimate && (
+              {!isEstimating && !salaryEstimate && (
                 <button
                   onClick={estimateSalary}
-                  disabled={isEstimating}
-                  className="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-4 rounded-md flex items-center gap-2 disabled:bg-green-400"
+                  className="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-4 rounded-md flex items-center gap-2"
                 >
-                  {isEstimating ? <Loader2 size={16} className="animate-spin" /> : <DollarSign size={16} />}
+                  <DollarSign size={16} />
                   Estimate Salary
                 </button>
               )}
@@ -163,7 +231,19 @@ const JobAnalysisApp = () => {
               )}
             </div>
             
-            {salaryEstimate && (
+            {isEstimating && (
+              <div className="mb-6 p-4 bg-green-50 border rounded-md">
+                <h3 className="text-lg font-semibold flex items-center gap-2 text-green-800 mb-4">
+                  <div className="flex items-center gap-2">
+                    <Loader2 size={18} className="animate-spin" />
+                    <span>Estimating Salary...</span>
+                  </div>
+                </h3>
+                {renderStreamingState()}
+              </div>
+            )}
+            
+            {!isEstimating && salaryEstimate && (
               <div className="mb-6 p-4 bg-green-50 border rounded-md">
                 <h3 className="text-lg font-semibold flex items-center gap-2 text-green-800 mb-2">
                   <DollarSign />
@@ -177,14 +257,13 @@ const JobAnalysisApp = () => {
                   <span>Confidence Level: {salaryEstimate.confidenceLevel}</span>
                 </div>
                 <div className="p-4 bg-blue-50 border rounded-md">
-                    <h3 className="text-lg font-semibold mb-2">Salary Analysis</h3>
-                    <div className="text-gray-700 whitespace-pre-line">
-                        {salaryEstimate.reasoning}
-                    </div>
+                  <h3 className="text-lg font-semibold mb-2">Salary Analysis</h3>
+                  <div className="text-gray-700 whitespace-pre-line">
+                    {salaryEstimate.reasoning}
+                  </div>
                 </div>
               </div>
             )}
-            
             
             {jobData.description && (
               <div className="mb-6">
